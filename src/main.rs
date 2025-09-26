@@ -1,45 +1,55 @@
-//Implement a skip list
-
 use rand::Rng;
-use std::fmt::Debug;
-use std::cell::RefCell;
 
-
-// Create a struct Node{id, payload, arr[]}
-fn main() {
-    println!("Hello, world!");
+#[derive(Debug)]
+struct Node {
+    id: i32,
+    payload: String,
+    forward: Vec<Option<Box<Node>>>,
 }
 
-struct SkipList{
-    max_level:i32,
-    p:132,
-    starter:Node
-}
-
-impl SkipList{
-    fn get_max_level(&self)->i32{
-        self.max_level
-    }
-    fn add_node(&self, id:i32, payload:string)->Option<&Node>{
-    }
-    fn gen_random_level(&self)->i32{
-        let lvl:i32 = 1
-        while rand::thread_rng().gen_range(0..100) < self.p && lvl<self.max_level{
-            level+=1
+impl Node {
+    fn new(id: i32, payload: String, level: usize) -> Self {
+        Node {
+            id,
+            payload,
+            forward: vec![None; level],
         }
-        return lvl
     }
-}
-#[derive(Clone, Debug)]
-struct Node<T: Eq + >{
-    id:i32,
-    payload:string,
-    fwd: []
 }
 
-impl Node{
-    fn add(&self, id:i32, payload:string)->Option<&Node>{
-        let lvl:132 = self.gen_random_level()
-        i   
+
+struct SkipList {
+    max_level: usize,
+    p: i32,
+    head: Box<Node>,
+}
+
+impl SkipList {
+    fn new(max_level: usize, p: i32) -> Self {
+        SkipList {
+            max_level,
+            p,
+            head: Box::new(Node::new(-1, String::new(), max_level)),
+        }
     }
+
+    fn gen_random_level(&self) -> usize {
+        let mut lvl = 1;
+        while rand::rng().gen_range(0..100) < self.p && lvl < self.max_level {
+            lvl += 1;
+        }
+        lvl
+    }
+
+    fn insert(&mut self, id: i32, payload: String) {
+        let lvl = self.gen_random_level();
+        let new_node = Box::new(Node::new(id, payload, lvl));
+        // TODO: update forward pointers
+        println!("Generated node with level {}", lvl);
+    }
+}
+
+fn main() {
+    let mut sl = SkipList::new(8, 50);
+    sl.insert(1, "hello".to_string());
 }
