@@ -1,27 +1,30 @@
+use std::rc::Rc;
+use std::cell::RefCell;
 use rand::Rng;
+
+const MAX_LEVEL: usize = 16;
 
 #[derive(Debug)]
 struct Node {
     id: i32,
     payload: String,
-    forward: Vec<Option<Box<Node>>>,
+    fwd: [Option<Rc<RefCell<Node>>>; MAX_LEVEL],
 }
 
 impl Node {
-    fn new(id: i32, payload: String, level: usize) -> Self {
+    fn new(id: i32, payload: String) -> Self {
         Node {
             id,
             payload,
-            forward: vec![None; level],
+            fwd: Default::default(),
         }
     }
 }
 
-
 struct SkipList {
     max_level: usize,
     p: i32,
-    head: Box<Node>,
+    head: Rc<RefCell<Node>>,
 }
 
 impl SkipList {
@@ -29,13 +32,14 @@ impl SkipList {
         SkipList {
             max_level,
             p,
-            head: Box::new(Node::new(-1, String::new(), max_level)),
+            head: Rc::new(RefCell::new(Node::new(-1, String::new()))),
         }
     }
 
     fn gen_random_level(&self) -> usize {
-        let mut lvl = 1;
-        while rand::rng().gen_range(0..100) < self.p && lvl < self.max_level {
+        let mut lvl = 0;
+        let mut rng = rand::rng();
+        while rng.random_range(0..100) < self.p && lvl < self.max_level - 1 {
             lvl += 1;
         }
         lvl
@@ -43,13 +47,21 @@ impl SkipList {
 
     fn insert(&mut self, id: i32, payload: String) {
         let lvl = self.gen_random_level();
-        let new_node = Box::new(Node::new(id, payload, lvl));
-        // TODO: update forward pointers
-        println!("Generated node with level {}", lvl);
+        let new_node = Rc::new(
+            RefCell::new(Node::new(id, payload))
+        );
+        for i in 0..=lvl {
+            let mut head = self.head.borrow_mut();
+            if let Some(next) = head.fwd[i].take() {
+                new_node.borrow_mut().fwd[i] = Some(next);
+            }
+            head.fwd[i] = Some(Rc::clone(&new_node));
+        }
     }
 }
 
 fn main() {
-    let mut sl = SkipList::new(8, 50);
+    let mut sl = SkipList::new(MAX_LEVEL, 50);
     sl.insert(1, "hello".to_string());
+    println!("{:#?}", sl.head);
 }
