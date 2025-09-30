@@ -8,7 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-
+use anyhow::{Result, anyhow};
+use log::{error, info};
 use crate::common::types::{FrameId, PageId};
 
 /// Access type (needed for leaderboard tests).
@@ -19,7 +20,7 @@ pub enum AccessType {
     Index,
     Unknown, 
 }
-
+#[derive(Debug)]
 pub enum ArcStatus{
     //most recently used
     MRU,
@@ -41,15 +42,13 @@ pub struct FrameStatus {
 }
 
 /// Adaptive Replacement Cache (ARC) Replacer.
-///
-/// TODO(P1): Implement ARC as described in the writeup.
 /// Keeps track of MRU, MFU, and their ghost lists.
 pub struct ArcReplacer {
     replacer_size: usize,
     mru_list: VecDeque<FrameId>,
     mfu_list: VecDeque<FrameId>,
     mru_ghost_list: VecDeque<FrameId>,
-    table: HashMap<FrameId, FrameStatus>,
+    pin_table: HashMap<FrameId, FrameStatus>,
     latch : Mutex<()>,
 }
 
@@ -67,38 +66,198 @@ impl ArcReplacer {
     }
 
     pub fn evict(&mut self) -> Option<FrameId> {
-        // TODO(P1)
+        let _guard = self.latch.lock().unwrap();
+
+        // Scan MRU list first
+        let mut idx = 0;
+        while idx < self.mru_list.len() {
+            let candt = self.mru_list[idx];
+            if let Some(status) = self.table.get(&candt) {
+                if status.evictable {
+                    let candt = self.mru_list.remove(idx).unwrap();
+                    self.mru_ghost_list.push_back(candt);
+                    if let Some(entry) = self.table.get_mut(&candt) {
+                        entry.arc_status = ArcStatus::MRUGhost;
+                    }
+                    return Some(candt);
+                }
+            }
+            idx += 1;
+        }
+
+        // Then scan MFU list
+        let mut idx = 0;
+        while idx < self.mfu_list.len() {
+            let candt = self.mfu_list[idx];
+            if let Some(status) = self.table.get(&candt) {
+                if status.evictable {
+                    let candt = self.mfu_list.remove(idx).unwrap();
+                    self.mfu_ghost_list.push_back(candt);
+                    if let Some(entry) = self.table.get_mut(&candt) {
+                        entry.arc_status = ArcStatus::MFUGhost;
+                    }
+                    return Some(candt);
+                }
+            }
+            idx += 1;
+        }
+        log::error!("No evictable frame found");
         None
     }
 
+
     /// Record access to a frame and update ARC bookkeeping.
-    ///
+    /// {TODO: after buffer pool manager}
     /// Four cases:
     /// 1. Frame exists in MRU/MFU
     /// 2. Frame exists in MRU ghost
     /// 3. Frame exists in MFU ghost
     /// 4. Miss everywhere
     pub fn record_access(&mut self, frame_id: FrameId, page_id: PageId, _access_type: AccessType) {
-        // TODO(P1)
+
     }
 
     /// Toggle whether a frame is evictable.
     /// Updates replacer size accordingly.
-    pub fn set_evictable(&mut self, frame_id: FrameId, set_evictable: bool) -> Result<()> {
-        // TODO(P1)
+    pub fn set_keep(&mut self, frame_id: FrameId) -> Result<()> {
+        if let Some(status) = self.table.get_mut(&frame_id) {
+            status.evictable = false;
+        }
+        Ok(())
+    }
+
+    pub fn set_evicted(&mut self, frame_id: FrameId) -> Result<()> {
+        if let Some(status) = self.table.get_mut(&frame_id) {
+            status.evictable = true;
+        }
         Ok(())
     }
 
     /// Remove an evictable frame from the replacer.
     /// If frame is not evictable → error.
     pub fn remove(&mut self, frame_id: FrameId) -> Result<()> {
-        // TODO(P1)
-        Ok(())
+        let _guard = self.latch.lock().unwrap();
+
+        // 1. Lookup frame
+        if let Some(status) = self.table.get(&frame_id) {
+            // 2. Check evictable
+            if !status.evictable {
+                return Err(anyhow::anyhow!("Frame {} is not evictable", frame_id));
+            }
+            // 3. Remove from the correct list
+            match status.arc_status {
+                ArcStatus::MRU => {
+                    if let Some(pos) = self.mru_list.iter().position(|&id| id == frame_id) {
+                        self.mru_list.remove(pos);
+                    }
+                }
+                ArcStatus::MFU => {
+                    if let Some(pos) = self.mfu_list.iter().position(|&id| id == frame_id) {
+                        self.mfu_list.remove(pos);
+                    }
+                }
+                ArcStatus::MRUGhost => {
+                    if let Some(pos) = self.mru_ghost_list.iter().position(|&id| id == frame_id) {
+                        self.mru_ghost_list.remove(pos);
+                    }
+                }
+                ArcStatus::MFUGhost => {
+                    if let Some(pos) = self.mfu_ghost_list.iter().position(|&id| id == frame_id) {
+                        self.mfu_ghost_list.remove(pos);
+                    }
+                }
+            }
+            //remove from table
+            self.table.remove(&frame_id);
+            Ok(())
+        } else {
+            // Frame not tracked
+            Err(anyhow::anyhow!("Frame {} not found in replacer", frame_id))
+        }
     }
 
     /// Return the number of evictable frames.
     pub fn size(&self) -> usize {
-        // TODO(P1)
+        let _guard = self.latch.lock().unwrap();
+        return self.table.values().filter(|status| status.evictable).count()
+    }
+    // check if it's still within the replacer size
+    fn check_size(&self, mem_type: ArcStatus) -> bool {
+        if mem_type == ArcStatus::MRU {
+            return self.mru_list.len() >= self.replacer_size;
+        } else if mem_type == ArcStatus::MFU {
+            return self.mfu_list.len() >= self.replacer_size;
+        } else if mem_type == ArcStatus::MRUGhost {
+            return self.mru_ghost_list.len() >= self.replacer_size;
+        } else {
+            return false; 
+            }
+        }
+    //delete from ghost deques if they exceed set replacer size
+    fn delete_ghost(&mut self){
+        if self.mru_ghost_list.len() > self.replacer_size {
+            self.mru_ghost_list.pop_front();
+        } else if self.mfu_ghost_list.len() > self.replacer_size {
+            self.mfu_ghost_list.pop_front();
+        }
+    }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::buffer::arc_replacer::{ArcReplacer, ArcStatus};
+    use crate::common::types::FrameId;
+
+    #[test]
+    fn test_insert_and_evict() {
+        let mut replacer = ArcReplacer::new(3); // capacity 3
+
+        // Insert frames
+        replacer.insert(1);
+        replacer.insert(2);
+        replacer.insert(3);
+
+        // Initially, all frames are evictable
+        assert!(replacer.table.get(&1).unwrap().evictable);
+        assert!(replacer.table.get(&2).unwrap().evictable);
+        assert!(replacer.table.get(&3).unwrap().evictable);
+
+        // Evict one frame
+        let victim = replacer.evict();
+        assert!(victim.is_some());
+        let victim_id = victim.unwrap();
+
+        // The victim should now be in the ghost list
+        let ghost_status = replacer.table.get(&victim_id).unwrap();
+        match ghost_status.arc_status {
+            ArcStatus::MRUGhost | ArcStatus::MFUGhost => {}
+            _ => panic!("Evicted frame not in ghost list"),
+        }
+    }
+
+    #[test]
+    fn test_set_evictable() {
+        let mut replacer = ArcReplacer::new(2);
+        replacer.insert(10);
+        replacer.insert(20);
+
+        // Pin frame 10 (set evictable = false)
+        replacer.set_evictable(10, false).unwrap();
+
+        // Trying to evict should skip frame 10 if it is MRU/MFU head
+        let victim = replacer.evict().unwrap();
+        assert_ne!(victim, 10);
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut replacer = ArcReplacer::new(2);
+        replacer.insert(100);
+        replacer.insert(200);
+
+        // Remove a frame
+        replacer.remove(100).unwrap();
+        assert!(replacer.table.get(&100).is_none());
     }
 }

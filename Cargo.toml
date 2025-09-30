@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 rand = "0.9.2"
+log = { version = "0.4", features = ["std", "serde"] }
+anyhow = { version = "1.0", default-features = false }
