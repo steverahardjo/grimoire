@@ -1,19 +1,23 @@
 # GRIMOIRE
-## SQL LIKE DBMS ENGINE
+## SQL-Like DBMS Engine
+
+This is a toy database I wrote in **Rust** to learn both the language and the internal workings of a database engine.  
+It follows the classic **frontend/backend architecture**, inspired by the design of the SQLite project.
+
 ---
-This is a toy database I written on rust to learn rust and internals of how database engine works.
-It follows the classic **frontend/backend architecture** basedon the example given by the sqllite project
----
+
 ## Features
+
 ### Frontend
-- SQL execution parser (select, from, join(simple), where etc)
-- SQL input parser (select, fro)
-- Query Planner (Turn ast into a backend/execution APIs call)
+- SQL execution parser (supports `SELECT`, `FROM`, simple `JOIN`, `WHERE`, etc.)
+- SQL input tokenizer/parser
+- Query planner (converts the AST into backend execution API calls)
 
 ### Backend
-- `execution/` engine with basic operators (sequentials)
-- `access/` loading data in memory and enable indexing
-- `buffer/` pool manager to load data from disk and write to disk
-- `storage/ ` abstraction for access to disk & page
-- `concur/` orchestrator in case of trnasaction and lock manager
+- `execution/` — execution engine with basic sequential operators
+- `access/` — handles in-memory data loading and indexing
+- `buffer/` — buffer pool manager for reading/writing data from/to disk
+- `storage/` — abstraction layer for page and disk access
+- `concur/` — transaction orchestrator and lock manager
+
 

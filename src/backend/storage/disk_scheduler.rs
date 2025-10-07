@@ -28,7 +28,7 @@ pub struct DiskRequest{
 }
 
 
-struct DiskScheduler{
+struct DiskScheduler<'a>{
     manager: &'a DiskManager,
     requests: Mutex<Vec<DiskRequest>>,
     scheduler_promise: oneshot::Sender<()>,
@@ -42,7 +42,18 @@ impl DiskScheduler{
             requests: Mutex::new(vec![]),
         }
     }
+    //start threads and decide requests is process and access to disk in order
+    pub fn StartWorkerThread(&self){
+        None
+    }
     pub fn CreatePromise(&self)->oneshot::Sender<()>{
         None
     }
-    pub fn Schedule(&self, requests:DiskRequests)->Resul
+    pub fn Schedule(&self, requests:&Vec<DiskRequest>)->Result<()>{
+
+    }
+    pub fn DeallocatePage(&self, delete_page_id:PageId)->Option<PageId>{
+        None
+    }
+
+}

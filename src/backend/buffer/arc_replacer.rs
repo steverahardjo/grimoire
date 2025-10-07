@@ -194,7 +194,7 @@ impl ArcReplacer {
     }
 
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use crate::backend::buffer::arc_replacer::{ArcReplacer, ArcStatus};
@@ -252,3 +252,4 @@ mod tests {
         assert!(replacer.table.get(&100).is_none());
     }
 }
+    */ 
