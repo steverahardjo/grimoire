@@ -20,4 +20,9 @@ It follows the classic **frontend/backend architecture**, inspired by the design
 - `storage/` — abstraction layer for page and disk access
 - `concur/` — transaction orchestrator and lock manager
 
+### Common
+- `errors` — set of enums representing the errors in this project
+- `types` — type of values being manipulated throughout the database engine
+- `channel`
+
 
