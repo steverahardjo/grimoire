@@ -1,7 +1,7 @@
 use std::fmt;
 use std::error::Error;
-use std::fs;
 
+#[derive(Debug)]
 pub enum DiskError {
     Io(std::io::Error),
     InvalidFile,

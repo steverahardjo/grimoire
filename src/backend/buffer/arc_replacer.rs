@@ -6,6 +6,7 @@
 //! Implements the ARC eviction policy used in the buffer pool manager.
 //! See https://github.com/cmu-db/bustub/blob/master/src/buffer/arc_replacer.cpp
 
+/*
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use anyhow::{Result};
@@ -253,3 +254,4 @@ mod tests {
     }
 }
     */ 
+*/

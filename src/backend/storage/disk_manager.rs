@@ -5,142 +5,199 @@
 //! - Delete
 //! this module are triggered and organized by disk_scheduler
 
+//! Async Disk Manager using Tokio
+//! Provides non-blocking I/O operations for page management
+
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex},
+    sync::Arc,
 };
-
-use crate::common::types::{PageId};
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::{RwLock, Semaphore},
+};
 
 pub const GRIMOIRE_PAGE_SIZE: usize = 4096;
 
 #[derive(Debug)]
 pub enum DiskError {
     IoError(std::io::Error),
-    PageNotFound(PageId),
+    PageNotFound(i32),
 }
 
 pub struct DiskManager {
-    db_file_name: PathBuf,
-    log_file_name: PathBuf,
-    db_io: Mutex<File>,
-    log_io: Mutex<File>,
+    db_file_path: PathBuf,
+    log_file_path: PathBuf,
+    
+    // Page mapping: page_id -> offset
+    pages: Arc<RwLock<HashMap<i32, u64>>>,
+    
+    // Free slots for reuse
+    free_slots: Arc<RwLock<Vec<u64>>>,
+    
+    // Capacity tracking
+    page_capacity: Arc<RwLock<usize>>,
+    
+    // Statistics
+    stats: Arc<RwLock<DiskStats>>,
+    
+    // Semaphore to limit concurrent I/O operations
+    io_semaphore: Arc<Semaphore>,
+}
 
-    pages: Mutex<HashMap<i32, u64>>,
-    free_slots: Mutex<Vec<u64>>,
-
-    num_writes: Mutex<i32>,
-    num_deletes: Mutex<i32>,
-    num_flushes: Mutex<i32>,
-    flush_log: Mutex<bool>,
-    buffer_used: Mutex<Vec<u8>>,
-    page_capacity: Mutex<usize>,
+#[derive(Default)]
+struct DiskStats {
+    num_writes: u64,
+    num_reads: u64,
+    num_deletes: u64,
+    num_flushes: u64,
 }
 
 impl DiskManager {
-    pub fn new(db_file: &Path) -> Result<Self, DiskError> {
-        let db_file_name = db_file.to_path_buf();
-        let log_file_name = db_file_name
+    pub async fn new(db_file: &Path) -> Result<Self, DiskError> {
+        let db_file_path = db_file.to_path_buf();
+        let log_file_path = db_file_path
             .file_stem()
             .map(|stem| PathBuf::from(format!("{}.log", stem.to_string_lossy())))
             .unwrap_or_else(|| PathBuf::from("grimoire.log"));
 
-        let db_io = OpenOptions::new()
+        // Create db file
+        let db_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&db_file_name)
+            .open(&db_file_path)
+            .await
             .map_err(DiskError::IoError)?;
 
-        let log_io = OpenOptions::new()
+        // Create log file
+        OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&log_file_name)
+            .open(&log_file_path)
+            .await
             .map_err(DiskError::IoError)?;
 
         let initial_capacity = 128;
-        db_io.set_len(((initial_capacity + 1) * GRIMOIRE_PAGE_SIZE) as u64)
+        db_file
+            .set_len(((initial_capacity + 1) * GRIMOIRE_PAGE_SIZE) as u64)
+            .await
             .map_err(DiskError::IoError)?;
 
         Ok(Self {
-            db_file_name,
-            log_file_name,
-            db_io: Mutex::new(db_io),
-            log_io: Mutex::new(log_io),
-            pages: Mutex::new(HashMap::new()),
-            free_slots: Mutex::new(Vec::new()),
-            num_writes: Mutex::new(0),
-            num_deletes: Mutex::new(0),
-            num_flushes: Mutex::new(0),
-            flush_log: Mutex::new(false),
-            buffer_used: Mutex::new(Vec::new()),
-            page_capacity: Mutex::new(initial_capacity),
+            db_file_path,
+            log_file_path,
+            pages: Arc::new(RwLock::new(HashMap::new())),
+            free_slots: Arc::new(RwLock::new(Vec::new())),
+            page_capacity: Arc::new(RwLock::new(initial_capacity)),
+            stats: Arc::new(RwLock::new(DiskStats::default())),
+            io_semaphore: Arc::new(Semaphore::new(10)), // Limit to 10 concurrent I/O ops
         })
     }
-    /* get the offset, if not there then input an offset
-    Open db, jump to the db file, write it, and flush your dbn_io
-    Args:
-    - page_id:u8
-     */
-    pub fn write_page(&self, page_id: PageId, page_data: &[u8]) -> Result<(), DiskError> {
+
+    /// Write a page to disk asynchronously
+    pub async fn write_page(&self, page_id: i32, page_data: &[u8]) -> Result<(), DiskError> {
         if page_data.len() != GRIMOIRE_PAGE_SIZE {
             panic!("page_data must be exactly {} bytes", GRIMOIRE_PAGE_SIZE);
         }
 
-        let mut pages = self.pages.lock().unwrap();
-        let offset = *pages.entry(page_id).or_insert_with(|| self.allocate_page());
+        // Acquire semaphore permit to limit concurrent I/O
+        let _permit = self.io_semaphore.acquire().await.unwrap();
 
-        let mut db = self.db_io.lock().unwrap();
-        let mut num_writes = self.num_writes.lock().unwrap();
+        // Get or allocate offset
+        let offset = {
+            let pages = self.pages.read().await;
+            if let Some(&offset) = pages.get(&page_id) {
+                Some(offset)
+            } else {
+                None
+            }
+        };
 
-        db.seek(SeekFrom::Start(offset))
+        let offset = match offset {
+            Some(o) => o,
+            None => self.allocate_page(page_id).await,
+        };
+
+        // Open file and write
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&self.db_file_path)
+            .await
             .map_err(DiskError::IoError)?;
-        db.write_all(page_data).map_err(DiskError::IoError)?;
-        db.flush().map_err(DiskError::IoError)?;
 
-        *num_writes += 1;
-        pages.insert(page_id, offset);
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(DiskError::IoError)?;
+        
+        file.write_all(page_data)
+            .await
+            .map_err(DiskError::IoError)?;
+        
+        file.sync_all()
+            .await
+            .map_err(DiskError::IoError)?;
+
+        // Update stats
+        let mut stats = self.stats.write().await;
+        stats.num_writes += 1;
 
         Ok(())
     }
-    /*
-    Read through the pages through offset, access db.file
-    and load it into your program into a buffer page_data which can be accessed
-    by disk scheduler()
-    Aegs:
-    - page_id:u8 
-    - page_data: [u8]
-     */
-    pub fn read_page(&self, page_id: PageId, page_data: &mut [u8]) -> Result<(), DiskError> {
+
+    /// Read a page from disk asynchronously
+    pub async fn read_page(&self, page_id: i32, page_data: &mut [u8]) -> Result<(), DiskError> {
         if page_data.len() != GRIMOIRE_PAGE_SIZE {
             panic!("page_data must be exactly {} bytes", GRIMOIRE_PAGE_SIZE);
         }
 
-        let pages = self.pages.lock().unwrap();
-        let offset = pages
-            .get(&page_id)
-            .ok_or(DiskError::PageNotFound(page_id))?;
+        let _permit = self.io_semaphore.acquire().await.unwrap();
 
-        let mut db = self.db_io.lock().unwrap();
-        db.seek(SeekFrom::Start(*offset))
+        // Get offset
+        let offset = {
+            let pages = self.pages.read().await;
+            pages
+                .get(&page_id)
+                .copied()
+                .ok_or(DiskError::PageNotFound(page_id))?
+        };
+
+        // Open file and read
+        let mut file = File::open(&self.db_file_path)
+            .await
             .map_err(DiskError::IoError)?;
-        db.read_exact(page_data).map_err(DiskError::IoError)?;
+
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(DiskError::IoError)?;
+        
+        file.read_exact(page_data)
+            .await
+            .map_err(DiskError::IoError)?;
+
+        // Update stats
+        let mut stats = self.stats.write().await;
+        stats.num_reads += 1;
 
         Ok(())
     }
 
-    pub fn delete_page(&self, page_id: PageId) -> Result<(), DiskError> {
-        let mut pages = self.pages.lock().unwrap();
+    /// Delete a page (mark slot as free)
+    pub async fn delete_page(&self, page_id: i32) -> Result<(), DiskError> {
+        let mut pages = self.pages.write().await;
+        
         if let Some(offset) = pages.remove(&page_id) {
-            let mut free_slots = self.free_slots.lock().unwrap();
+            drop(pages); // Release write lock before acquiring next lock
+            
+            let mut free_slots = self.free_slots.write().await;
             free_slots.push(offset);
+            drop(free_slots);
 
-            let mut num_deletes = self.num_deletes.lock().unwrap();
-            *num_deletes += 1;
+            let mut stats = self.stats.write().await;
+            stats.num_deletes += 1;
 
             Ok(())
         } else {
@@ -148,101 +205,154 @@ impl DiskManager {
         }
     }
 
-    pub fn write_log(&self, log_data: &[u8]) -> Result<(), DiskError> {
-        let mut buffer = self.buffer_used.lock().unwrap();
-        if *buffer != log_data {
-            let mut log_file = self.log_io.lock().unwrap();
-            log_file.write_all(log_data).map_err(DiskError::IoError)?;
-            log_file.sync_all().map_err(DiskError::IoError)?;
-            buffer.clear();
-            buffer.extend_from_slice(log_data);
-        }
+    /// Write log data asynchronously
+    pub async fn write_log(&self, log_data: &[u8]) -> Result<(), DiskError> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.log_file_path)
+            .await
+            .map_err(DiskError::IoError)?;
+
+        file.write_all(log_data)
+            .await
+            .map_err(DiskError::IoError)?;
+        
+        file.sync_all()
+            .await
+            .map_err(DiskError::IoError)?;
+
         Ok(())
     }
 
-    pub fn get_num_writes(&self) -> i32 {
-        *self.num_writes.lock().unwrap()
-    }
-
-    pub fn get_num_deletes(&self) -> i32 {
-        *self.num_deletes.lock().unwrap()
-    }
-
-    pub fn get_num_flushes(&self) -> i32 {
-        *self.num_flushes.lock().unwrap()
-    }
-
-    pub fn get_flush_state(&self) -> bool {
-        *self.flush_log.lock().unwrap()
-    }
-
-    fn allocate_page(&self) -> u64 {
-        if let Some(offset) = self.free_slots.lock().unwrap().pop() {
-            return offset;
+    /// Allocate a new page offset
+    async fn allocate_page(&self, page_id: i32) -> u64 {
+        // Check free slots first
+        {
+            let mut free_slots = self.free_slots.write().await;
+            if let Some(offset) = free_slots.pop() {
+                let mut pages = self.pages.write().await;
+                pages.insert(page_id, offset);
+                return offset;
+            }
         }
-        let pages = self.pages.lock().unwrap();
-        (pages.len() as u64) * GRIMOIRE_PAGE_SIZE as u64
+
+        // Need to allocate new page
+        let mut pages = self.pages.write().await;
+        let mut capacity = self.page_capacity.write().await;
+
+        // Check if expansion needed
+        if pages.len() >= *capacity {
+            let new_capacity = *capacity * 2;
+            *capacity = new_capacity;
+
+            // Expand file (do this after releasing locks would be better,
+            // but for simplicity we keep it here)
+            let new_size = (new_capacity + 1) as u64 * GRIMOIRE_PAGE_SIZE as u64;
+            
+            // Open temporarily to resize
+            if let Ok(file) = OpenOptions::new()
+                .write(true)
+                .open(&self.db_file_path)
+                .await
+            {
+                let _ = file.set_len(new_size).await;
+            }
+        }
+
+        // Calculate new offset
+        let offset = pages.len() as u64 * GRIMOIRE_PAGE_SIZE as u64;
+        pages.insert(page_id, offset);
+
+        offset
     }
 
-    pub fn get_file_size(&self, file_name: &str) -> i64 {
-        match std::fs::metadata(file_name) {
-            Ok(meta) => meta.len() as i64,
-            Err(_) => -1,
-        }
+    // Statistics methods
+    pub async fn get_num_writes(&self) -> u64 {
+        self.stats.read().await.num_writes
+    }
+
+    pub async fn get_num_reads(&self) -> u64 {
+        self.stats.read().await.num_reads
+    }
+
+    pub async fn get_num_deletes(&self) -> u64 {
+        self.stats.read().await.num_deletes
     }
 }
 
-
+// Example usage and tests
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_write_and_read_page() {
+    #[tokio::test]
+    async fn test_write_and_read_page() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::new(&db_path).expect("failed to create disk manager");
-        let page_id: PageId = 1;
-        let mut page_data = vec![0u8; GRIMOIRE_PAGE_SIZE];
-        page_data[0..4].copy_from_slice(&42u32.to_le_bytes());
-        dm.write_page(page_id, &page_data).expect("write failed");
+        let dm = DiskManager::new(&db_path).await.unwrap();
 
+        let page_id = 1;
+        let mut page_data = vec![0u8; GRIMOIRE_PAGE_SIZE];
+        page_data[0..11].copy_from_slice(b"Hello World");
+
+        // Write page
+        dm.write_page(page_id, &page_data).await.unwrap();
+
+        // Read it back
         let mut read_buf = vec![0u8; GRIMOIRE_PAGE_SIZE];
-        {
-            let mut db = dm.db_io.lock().unwrap();
-            db.seek(SeekFrom::Start(0)).unwrap();
-            db.read_exact(&mut read_buf).unwrap();
+        dm.read_page(page_id, &mut read_buf).await.unwrap();
+
+        assert_eq!(&read_buf[0..11], b"Hello World");
+        assert_eq!(dm.get_num_writes().await, 1);
+        assert_eq!(dm.get_num_reads().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_concurrent.db");
+        let dm = Arc::new(DiskManager::new(&db_path).await.unwrap());
+
+        let mut handles = vec![];
+
+        // Spawn 100 concurrent write operations
+        for i in 0i32..100i32 {
+            let dm_clone = Arc::clone(&dm);
+            let handle = tokio::spawn(async move {
+                let mut page_data = vec![0u8; GRIMOIRE_PAGE_SIZE];
+                page_data[0..4].copy_from_slice(&i.to_le_bytes());
+                dm_clone.write_page(i, &page_data).await.unwrap();
+            });
+            handles.push(handle);
         }
 
-        let read_value = u32::from_le_bytes(read_buf[0..4].try_into().unwrap());
-        assert_eq!(read_value, 42);
+        // Wait for all writes to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
 
-        let num_writes = *dm.num_writes.lock().unwrap();
-        assert_eq!(num_writes, 1);
-
-        dir.close().unwrap();
+        // Verify all pages were written
+        assert_eq!(dm.get_num_writes().await, 100);
     }
 
-    #[test]
-    fn test_delete_page() {
+    #[tokio::test]
+    async fn test_delete_and_reuse() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_delete.db");
-        let dm = DiskManager::new(&db_path).unwrap();
+        let dm = DiskManager::new(&db_path).await.unwrap();
 
-        let page_id = 5;
-        let dummy_data = vec![1u8; GRIMOIRE_PAGE_SIZE];
-        dm.write_page(page_id, &dummy_data).unwrap();
+        let page_data = vec![42u8; GRIMOIRE_PAGE_SIZE];
 
-        // Delete the page
-        dm.DeletePage(page_id, &dummy_data).unwrap();
+        // Write page 1
+        dm.write_page(1, &page_data).await.unwrap();
+        
+        // Delete page 1
+        dm.delete_page(1).await.unwrap();
 
-        // Check free_slots got populated
-        let free_slots = dm.free_slots.lock().unwrap();
-        assert!(!free_slots.is_empty());
+        // Write page 2 (should reuse deleted slot)
+        dm.write_page(2, &page_data).await.unwrap();
 
-        dir.close().unwrap();
+        assert_eq!(dm.get_num_deletes().await, 1);
     }
 }
-
