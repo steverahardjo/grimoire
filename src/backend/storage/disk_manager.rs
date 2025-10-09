@@ -19,12 +19,16 @@ use tokio::{
     sync::{RwLock, Semaphore},
 };
 
+use crate::common::{errors::DiskError, types::PageId};
+
 pub const GRIMOIRE_PAGE_SIZE: usize = 4096;
 
-#[derive(Debug)]
-pub enum DiskError {
-    IoError(std::io::Error),
-    PageNotFound(i32),
+#[derive(Default)]
+struct DiskStats {
+    num_writes: u64,
+    num_reads: u64,
+    num_deletes: u64,
+    num_flushes: u64,
 }
 
 pub struct DiskManager {
@@ -32,7 +36,7 @@ pub struct DiskManager {
     log_file_path: PathBuf,
     
     // Page mapping: page_id -> offset
-    pages: Arc<RwLock<HashMap<i32, u64>>>,
+    pages: Arc<RwLock<HashMap<PageId, u64>>>,
     
     // Free slots for reuse
     free_slots: Arc<RwLock<Vec<u64>>>,
@@ -45,14 +49,6 @@ pub struct DiskManager {
     
     // Semaphore to limit concurrent I/O operations
     io_semaphore: Arc<Semaphore>,
-}
-
-#[derive(Default)]
-struct DiskStats {
-    num_writes: u64,
-    num_reads: u64,
-    num_deletes: u64,
-    num_flushes: u64,
 }
 
 impl DiskManager {
@@ -99,30 +95,33 @@ impl DiskManager {
     }
 
     /// Write a page to disk asynchronously
-    pub async fn write_page(&self, page_id: i32, page_data: &[u8]) -> Result<(), DiskError> {
+    pub async fn write_page(&self, page_id: PageId, page_data: &[u8]) -> Result<(), DiskError> {
         if page_data.len() != GRIMOIRE_PAGE_SIZE {
             panic!("page_data must be exactly {} bytes", GRIMOIRE_PAGE_SIZE);
         }
 
-        // Acquire semaphore permit to limit concurrent I/O
         let _permit = self.io_semaphore.acquire().await.unwrap();
 
-        // Get or allocate offset
+        // Ensure the page_id is allocated first
         let offset = {
-            let pages = self.pages.read().await;
+            let mut pages = self.pages.write().await;
             if let Some(&offset) = pages.get(&page_id) {
-                Some(offset)
+                offset
             } else {
-                None
+                // Allocate new page atomically while holding write lock
+                let mut free_slots = self.free_slots.write().await;
+                if let Some(offset) = free_slots.pop() {
+                    pages.insert(page_id, offset);
+                    offset
+                } else {
+                    let offset = pages.len() as u64 * GRIMOIRE_PAGE_SIZE as u64;
+                    pages.insert(page_id, offset);
+                    offset
+                }
             }
         };
 
-        let offset = match offset {
-            Some(o) => o,
-            None => self.allocate_page(page_id).await,
-        };
-
-        // Open file and write
+        // Now perform I/O safely
         let mut file = OpenOptions::new()
             .write(true)
             .open(&self.db_file_path)
@@ -132,24 +131,22 @@ impl DiskManager {
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(DiskError::IoError)?;
-        
         file.write_all(page_data)
             .await
             .map_err(DiskError::IoError)?;
-        
         file.sync_all()
             .await
             .map_err(DiskError::IoError)?;
 
-        // Update stats
         let mut stats = self.stats.write().await;
         stats.num_writes += 1;
 
         Ok(())
     }
 
+
     /// Read a page from disk asynchronously
-    pub async fn read_page(&self, page_id: i32, page_data: &mut [u8]) -> Result<(), DiskError> {
+    pub async fn read_page(&self, page_id: PageId, page_data: &mut [u8]) -> Result<(), DiskError> {
         if page_data.len() != GRIMOIRE_PAGE_SIZE {
             panic!("page_data must be exactly {} bytes", GRIMOIRE_PAGE_SIZE);
         }
@@ -186,7 +183,7 @@ impl DiskManager {
     }
 
     /// Delete a page (mark slot as free)
-    pub async fn delete_page(&self, page_id: i32) -> Result<(), DiskError> {
+    pub async fn delete_page(&self, page_id: PageId) -> Result<(), DiskError> {
         let mut pages = self.pages.write().await;
         
         if let Some(offset) = pages.remove(&page_id) {
@@ -225,7 +222,7 @@ impl DiskManager {
     }
 
     /// Allocate a new page offset
-    async fn allocate_page(&self, page_id: i32) -> u64 {
+    async fn allocate_page(&self, page_id:PageId) -> u64 {
         // Check free slots first
         {
             let mut free_slots = self.free_slots.write().await;
